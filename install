@@ -1,0 +1,607 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Totara installer.
+ *
+ * PHP version 5
+ *
+ * @author    Tyler Bannister <tyler.bannister@remote-learner.net>
+ * @copyright 2016 Remote-Learner, Inc.
+ * @license   http://www.gnu.org/licenses/gpl-3.0.txt GNU GPLv3
+ * @link      http://git.remote-learner.net/private.cgi?p=rlscripts.git
+ */
+require_once(dirname(__FILE__).'/../lib/config-2.php');
+require_once($_RLSCRIPTS->lib.'/moodlelib.php');
+require_once($_RLSCRIPTS->lib.'/webserviceslib.php');
+require_once($_RLSCRIPTS->lib.'/menuitem.php');
+require_once($_RLSCRIPTS->lib.'/install_lib.php');
+require_once($_RLSCRIPTS->lib.'/cache_setting.class.php');
+
+get_options(array());
+
+$newvhost = false;
+$config = new stdClass();
+$config->dbhost  = '';  // Default to unknown.
+$config->wwwroot = '';  // Default to empty.
+
+$clientadminuser = new stdClass();
+$front = new stdClass();
+
+RLSCRIPTS_Git::verify_keys();
+
+$cachesetting = new cache_setting($DIR_CACHE.'/totara_install.cache.ini');
+
+$apache = new RLSCRIPTS_Apache_manager($_SHELL);
+$manager = new RLSCRIPTS_Totara_Manager(null, $_CLI);
+$manager->message("\nRL Scripts Totara Installer\n");
+$manager->message("Please enter the following information...\n");
+
+$csetting = '';
+if ($cachesetting->exists()) {
+    $question = 'Your installation settings were recovered from previous failed script run. Would you like to use them? (y/n)';
+    $response = $manager->prompt($question, '/^[yn]/i', 'no');
+    // New line.
+    $manager->message('');
+    if (substr($response, 0, 1) == 'y') {
+        // Read user settings from previous script run so that we don't prompt the user for the values again.
+        if (($csetting = $cachesetting->read()) === false) {
+            $manager->warning('Failed reading from cache file.');
+        }
+    } else {
+        // Remove cache file.
+        if ($cachesetting->remove() === false) {
+            $manager->warning('Failed to remove cache file.');
+        }
+    }
+}
+
+$prompt = 'Client username (3-8 letters, numbers or underscores):';
+$usernameitem = new menuitem_regex('8', $prompt, '/^\w{3,8}$/', '', 'Client username:');
+if (isset($csetting->username)) {
+    $usernameitem->set_value($csetting->username);
+} else {
+    $usernameitem->prompt();
+}
+$username = $usernameitem->get_value();
+
+$issimplecfg = false;
+$dbname = $username.'_totara';
+$dbuser = $username.'_admin';
+
+$osrelease = os_release();
+
+$dirsettings = array(
+    'redhat' => array(
+        'dirroot'       => '/opt/rlcache/www/moodle_prod',
+        'dataroot'      => '/mnt/data/moodledata_prod',
+        'cachedir'      => '/opt/rlcache/moodledata_prod/cache',
+        'sessiondir'    => '/opt/rlcache/moodledata_prod/sessions',
+        'localcachedir' => '/opt/rlcache/moodledata_prod/localcache',
+        'lockdir'       => '/opt/rlcache/moodledata_prod/lock',
+        'mucdir'        => '/opt/rlcache/moodledata_prod/muc'
+    ),
+    'centos6' => array(
+        'dirroot'       => '/mnt/code/www/moodle_prod',
+        'dataroot'      => '/mnt/data/moodledata_prod',
+        'cachedir'      => '/mnt/scratch/moodledata_prod/cache',
+        'sessiondir'    => '/mnt/scratch/moodledata_prod/sessions',
+        'localcachedir' => '/mnt/scratch/moodledata_prod/localcache',
+        'lockdir'       => '/mnt/scratch/moodledata_prod/lock',
+        'mucdir'        => '/mnt/scratch/moodledata_prod/muc'
+    ),
+    'centos7' => array(
+        'dirroot'       => '/mnt/code/www/moodle_prod',
+        'dataroot'      => '/mnt/data/moodledata_prod',
+        'cachedir'      => '/mnt/code/scratch/moodledata_prod/cache',
+        'sessiondir'    => '/mnt/code/scratch/moodledata_prod/sessions',
+        'localcachedir' => '/mnt/code/scratch/moodledata_prod/localcache',
+        'lockdir'       => '/mnt/code/scratch/moodledata_prod/lock',
+        'mucdir'        => '/mnt/code/scratch/moodledata_prod/muc'
+    )
+);
+
+// Figure out the OS before initializing the default configuration paths
+$os = 'redhat';
+if ($osrelease->centos) {
+    $os = 'centos'.$osrelease->major_version;
+}
+$cachedir = $dirsettings[$os]['cachedir'];
+
+// Some config settings such as "$config->sessiondir" do not correspond to Totara's config settings as no such setting exists.
+foreach ($dirsettings[$os] as $setting => $path) {
+     $config->{$setting} = $path;
+}
+
+// Use the new project "Simple" config file format if config_prep exists.
+if (file_exists('/etc/php.d/config_prep.php')) {
+    $simpledirroot = $config->dirroot;
+    $simpledataroot = $config->dataroot;
+    $dbname = 'totara_prod';
+    $dbuser = 'totara';
+    $issimplecfg = true;
+}
+
+$config->dbname = $dbname;
+$config->dbuser = $dbuser;
+if (isset($csetting->dbpass)) {
+    $config->dbpass = $csetting->dbpass;
+} else if ($issimplecfg && file_exists($_RLSCRIPTS->cache.'/firstboot.cache')) {
+    $firstboot = parse_ini_file($_RLSCRIPTS->cache.'/firstboot.cache');
+    $config->dbpass = $firstboot['mpass'];
+} else {
+    $config->dbpass = rlscripts_generate_password();
+}
+
+$clientadminuser->username = $username;
+$clientadminuser->password = $config->dbpass;
+if (isset($csetting->password)) {
+    $clientadminuser->password = $csetting->password;
+}
+
+$manager->set_config($config);
+$manager->set_log_file('rlscripts-install-'.date('Y-m-d-His').'.log');
+
+$firstnameitem  = new menuitem('10', 'Client first name:');
+$lastnameitem   = new menuitem('11', 'Client last name:');
+$emailitem      = new menuitem_regex('12', 'Client email:', '/@/');
+$fullnameitem   = new menuitem('13', 'Client organization name:');
+
+$usersettings = array('firstname' => $firstnameitem, 'lastname' => $lastnameitem, 'email' => $emailitem, 'fullname' => $fullnameitem);
+foreach ($usersettings as $key => $setting) {
+    if (isset($csetting->{$key})) {
+        $setting->set_value($csetting->{$key});
+    } else {
+        $setting->prompt();
+    }
+}
+
+$wwwrootitem = new menuitem_url('5', 'Full URL of the Totara site:', $config->wwwroot, 'Full URL:');
+if (isset($csetting->wwwroot)) {
+    $wwwrootitem->set_value($csetting->wwwroot);
+} else {
+    $wwwrootitem->prompt();
+}
+$domain = parse_url($wwwrootitem->get_value(), PHP_URL_HOST);
+
+if (is_file($config->dirroot.'/apc.php')) {
+    // This file needs to be somewhere else (applies to RHEV only).
+    unlink($config->dirroot.'/apc.php');
+}
+
+$config->wwwroot = $wwwrootitem->get_value();
+$urlpath = parse_url($config->wwwroot, PHP_URL_PATH);
+$url = str_replace($urlpath, '', $config->wwwroot);
+
+$dirrootdomain = '/mnt/data/www/'.$domain;
+$dirrootdomainurlpath = '/mnt/data/www/'.$domain.$urlpath;
+if ($issimplecfg) {
+    $dirrootdomain = $dirrootdomainurlpath = $simpledirroot;
+}
+
+if ((rlscripts_hostname() != $domain) && $apache->vhost_exists($domain)) {
+    if (!$issimplecfg) {
+        $config->dataroot = '/mnt/data/moodledata_'.$domain;
+    }
+    if (is_web_accessible($url, $dirrootdomain)) {
+        // Existing virtual host w/ standard setup.
+        $config->dirroot = $dirrootdomainurlpath;
+        $parent = RLSCRIPTS_Totara::getConfig($dirrootdomain);
+
+        if ($parent !== false) {
+            $config->dbhost = $parent->dbhost;
+            $config->dbuser = $parent->dbuser;
+            $config->dbpass = $parent->dbpass;
+            $clientadminuser->password = $config->dbpass;
+
+            if (isset($parent->passwordsaltmain) && strlen($parent->passwordsaltmain) > 0) {
+                $config->passwordsaltmain = $parent->passwordsaltmain;
+            }
+        }
+    } else {
+        // Existing virtual host w/ NON-standard setup.
+        $message  = 'There appears to be an existing Apache virtual host for the domain "';
+        $message .= $domain.'", but it does NOT point to the expected directory ';
+        $message .= "'$dirrootdomain'. Please enter the correct directory into ";
+        $message .= 'which you want to install Totara:';
+        echo "\n";
+        if (isset($csetting->dirroot)) {
+            $config->dirroot = $csetting->dirroot;
+        } else {
+            $config->dirroot = $manager->prompt($message, '/^(\/[\w\-\.\/]+|)$/i', '');
+        }
+    }
+} else if (is_web_accessible($url, $config->dirroot) && not_empty_dir($config->dirroot)) {
+    // Default virtual host.
+    if (!$issimplecfg) {
+        $config->dirroot = rtrim($config->dirroot.$urlpath, '/');
+    }
+} else {
+    $config->dirroot = $dirrootdomainurlpath;
+    if (!$issimplecfg) {
+        $config->dataroot = '/mnt/data/moodledata_'.$domain;
+    }
+    $newvhost = true;
+}
+
+$installoptions = array(
+    0 => 'Totara',
+    1 => 'Other (Including CCRMS)',
+);
+print("\n");
+$prompt = 'Select the Totara version to install:';
+$install = new menuitem_list('', $prompt, $installoptions, 1);
+if (isset($csetting->install)) {
+    $install->set_value($csetting->install);
+} else {
+    $install->set_value('Totara');
+}
+
+$repositories = array(
+    0 => 'totara.git',
+    1 => '',
+);
+
+$repoitem = new menuitem_regex('14', 'Git repository (totara.xxx.git):', '/^totara[\w\.]+\.git$/', $repositories[$install->get_value()], 'Git repository');
+if (isset($csetting->repository)) {
+    $repoitem->set_value($csetting->repository);
+}
+if ($repoitem->get_formatted_value() == '') {
+    $repoitem->prompt();
+}
+
+$manager->message("Beginning default settings check\n");
+
+// Set the configuration settings from the cache.
+foreach ($dirsettings[$os] as $setting => $path) {
+    if (isset($csetting->{$setting})) {
+        $config->{$setting} = $csetting->{$setting};
+    }
+}
+
+$directoryitems = array(
+    'dirroot'       => new menuitem_dir('6', 'Web directory:'),
+    'dataroot'      => new menuitem_dir('7', 'Data directory:'),
+    'cachedir'      => new menuitem('17', 'Cache directory:', $config->cachedir),
+    'sessiondir'    => new menuitem('18', 'Session directory:', $config->sessiondir),
+    'mucdir'        => new menuitem('19', 'Muc directory:', $config->mucdir),
+    'lockdir'       => new menuitem('20', 'Lock directory:', $config->lockdir),
+    'localcachedir' => new menuitem('21', 'Local cache directory:', $config->localcachedir)
+);
+
+$config->datarootextended = '';
+if ($issimplecfg) {
+    // "datarootextended" is not a real Totara config setting but setting it works in our context.
+    $config->datarootextended = '/opt/rlcache/moodledata_prod';
+    if ($os === 'centos6') {
+        $config->datarootextended = '/mnt/scratch/moodledata_prod';
+    } else if ($os === 'centos7') {
+        $config->datarootextended = '/mnt/code/scratch/moodledata_prod';
+    }
+    if (!file_exists($config->datarootextended)) {
+        $manager->status("Creating '{$config->datarootextended}' directory");
+        if (mkdir($config->datarootextended, 0770, true)) {
+            $manager->success();
+        } else {
+            $manager->error("Unable to create directory '{$config->datarootextended}'");
+        }
+    }
+    // The firstboot script creates the dataroot directory and puts links in it.
+    $directoryitems['dataroot']->set_allow_non_empty_dir(true);
+}
+
+foreach ($directoryitems as $directory => $item) {
+    $manager->status("Checking $directory setting");
+
+    if (!$item->set_value($config->$directory)) {
+        $manager->failure();
+        $manager->message($item->error);
+        $item->prompt();
+    } else {
+        $manager->success();
+    }
+
+    $directoryitems[$directory] = $item;
+}
+
+$manager->status("Checking MySQL settings");
+
+$config->dbhost = $manager->default_dbhost($config->dbhost);
+$db = new db_mysql();
+$db->password_prompt_enabled(true);
+if (isset($csetting->dbhost)) {
+    $config->dbhost = $csetting->dbhost;
+}
+$db->set_host($config->dbhost);
+if ($db->connect() === false) {
+    $manager->error('Unable to connect to the MySQL server at "'.$config->dbhost.'" as root.');
+}
+
+if (isset($csetting->dbuser)) {
+    $config->dbuser = $csetting->dbuser;
+}
+$dbuseritem = new menuitem_regex('3', 'Database user:', '/^\w{4,16}$/i', $config->dbuser);
+
+// Simple configs are not multi-client so they can use the same db user.
+if (!$issimplecfg) {
+    while ($db->user_exists($config->dbuser)) {
+        $manager->message("The database user \"{$config->dbuser}\" already exists. Please enter a different user.");
+        $dbuseritem->prompt();
+        $config->dbuser = $dbuseritem->get_value();
+    }
+}
+
+if (isset($csetting->dbname)) {
+    $config->dbname = $csetting->dbname;
+}
+$dbnameitem = new menuitem_db('2', 'Database name:', '', $config->dbname);
+if ($issimplecfg) {
+    // The firstboot script creates the database.
+    $dbnameitem->set_allow_db(true);
+}
+$dbnameitem->set_dependency($config->dbhost);
+
+// Branch must be selected after dbhost is set, so MYSQL version can be considered.
+$branches = $manager->get_branches();
+$branchitem = new menuitem_list_dependent('15', 'Type the number of the branch you\'d like to use:',
+                                          $branches, $repoitem->get_value(), '', 'Git repository branch');
+
+echo "\n";
+if (isset($csetting->branch)) {
+    $branchitem->set_value($csetting->branch);
+} else {
+    $branchitem->prompt();
+}
+echo "\n";
+
+$version = intval(substr($branchitem->get_formatted_value(), 7, 2));
+$pluses = array();
+if ($version >= 27) {
+    $pluses = array('auth_rladmin','block_rlagent','theme_altitude');
+}
+
+$gaoitem = new menuitem('16', 'Type the names of the plugins you\'d like to activate (separated by commas):',
+                        implode(',',$pluses), 'Activated plugins');
+
+$intro = "\n" . 'Below are the settings that have been chosen for the Totara site so far.'
+        ."\n" . 'If you\'d like to change any of them, type the number next to that setting.'
+        ."\n";
+
+$client_pass = 'Client password:';
+
+$manager->success();
+
+$options = array(
+    'dbhost'        => new menuitem_ip('1', 'MySQL server:', $config->dbhost),
+    'dbname'        => $dbnameitem,
+    'dbuser'        => $dbuseritem,
+    'dbpass'        => new menuitem('4', 'MySQL password:', $config->dbpass),
+    'wwwroot'       => $wwwrootitem,
+    'dirroot'       => $directoryitems['dirroot'],
+    'dataroot'      => $directoryitems['dataroot'],
+    'username'      => $usernameitem,
+    'password'      => new menuitem('9', $client_pass, $clientadminuser->password),
+    'firstname'     => $firstnameitem,
+    'lastname'      => $lastnameitem,
+    'email'         => $emailitem,
+    'fullname'      => $fullnameitem,
+    'repository'    => $repoitem,
+    'branch'        => $branchitem,
+    'pluses'        => $gaoitem,
+    'cachedir'      => $directoryitems['cachedir'],
+    'sessiondir'    => $directoryitems['sessiondir'],
+    'mucdir'        => $directoryitems['mucdir'],
+    'lockdir'       => $directoryitems['lockdir'],
+    'localcachedir' => $directoryitems['localcachedir']
+);
+
+$menu = new menu($_CLI, $options, $intro, '', $manager);
+$menu->add_dependency('repository', 'branch');
+$menu->add_dependency('dbhost', 'dbname');
+
+// Callback option generator for branches when dbhost changes
+$generator = function($value) use ($config) {
+    $config->dbhost = $value;
+    $manager = new RLSCRIPTS_Totara_Manager($config);
+    return $manager->get_branches();
+};
+$menu->add_dependency('dbhost', 'branch', $generator);
+
+$menu->run();
+$values = $menu->get_values();
+
+$cachevalues = array_merge(array('install' => $installoptions[$install->get_value()]), $values);
+// Save user settings so they can be reused in case script does not complete.
+if ($cachesetting->save($cachevalues) === false) {
+    $manager->warning('Failed saving settings to cache file.');
+}
+
+$configs = array('dbhost', 'dbname', 'dbuser', 'dbpass', 'dirroot', 'dataroot');
+foreach ($configs as $name) {
+    $config->$name = $values[$name];
+}
+
+$clients = array('username', 'password', 'firstname', 'lastname', 'email', 'fullname');
+foreach ($clients as $name) {
+    $clientadminuser->$name = $values[$name];
+}
+
+$config->wwwroot = rtrim($values['wwwroot'], '/ ');
+$front->fullname = $values['fullname'];
+$config->rlscripts_git_repo = $values['repository'];
+$config->rlscripts_git_branch = $values['branch'];
+$pluses = explode(',', $values['pluses']);
+$config->sessiondir = $values['sessiondir'];
+$config->cachedir = $values['cachedir'];
+$config->mucdir = $values['mucdir'];
+$config->lockdir = $values['lockdir'];
+$config->localcachedir = $values['localcachedir'];
+
+$linkpath = '';
+$webdir = '/mnt/data/www';
+
+if (substr($config->dirroot, 0, strlen($webdir)) === $webdir) {
+    // Must not having trailing slash when checking if a directory is a link
+    if (is_link(rtrim($webdir, '/'))) {
+        $real = realpath($webdir);
+        $answer = $manager->message("\nThis site will be created in the local cache directory: $real");
+        $answer = $manager->prompt('Continue (y/n)?', '/^[yn]/i', 'yes');
+        if (strtolower($answer[0]) !== 'y') {
+            exit;
+        }
+    } else {
+        if (is_dir($cachedir)) {
+            $message = "This server is not using the local $cachedir directory for all sites.";
+            $manager->message($message);
+            $answer = $manager->prompt("Would you like to put this site in $cachedir (y/n)?", '/^[yn]/i', 'yes');
+            if (strtolower($answer[0]) === 'y') {
+                $linkpath = $config->dirroot;
+                $config->dirroot = $cachedir.substr($config->dirroot, strlen($webdir));
+            }
+        } else {
+            $message = 'There does not appear to be a local cache directory on this server.';
+            $manager->message($message);
+            $answer = $manager->prompt('Continue (y/n)?', '/^[yn]/i', 'yes');
+            if (strtolower($answer[0]) === 'n') {
+                exit;
+            }
+        }
+    }
+}
+
+// Make sure directory is empty.
+if (not_empty_dir($config->dirroot)) {
+    $manager->error("The directory \"{$config->dirroot}\" is not empty.");
+}
+
+$manager->set_config($config);
+$manager->git_clone($config->rlscripts_git_repo, $config->rlscripts_git_branch);
+
+if (!$manager->block()) {
+    $manager->warning('Failed creating htaccess rules');
+}
+
+if ($newvhost) {
+
+    $manager->status('Creating Apache virtual host.');
+    if (!$apache->create_moodle_virtual_host($domain, $config->dirroot)) {
+        $manager->warning('Failed creating Apache virtual host');
+    } else {
+        $manager->success();
+
+        $manager->status('Restarting Apache...');
+        if (!$apache->restart()) {
+            $manager->error('Failed to restart apache while creating virtual host.'."\n".$_SHELL->stderr());
+        }
+        $manager->success();
+    }
+}
+
+if (!empty($linkpath) && !symlink($config->dirroot, $linkpath)) {
+    $manager->warning("Failed creating symbolic link from $linkpath to $config->dirroot.");
+}
+
+
+$manager->create_dataroot();
+$manager->generate_config_file(true, $repobranch);
+$manager->create_defaults_file();
+$manager->fix_permissions();
+
+// Real path can only be used after the directories are created or else it will return a blank.
+$config->dirroot = realpath($config->dirroot);
+$config->dataroot = realpath($config->dataroot);
+
+$manager->status('Creating MySQL database and user');
+$db = new db_mysql();
+$db->password_prompt_enabled(true);
+$db->set_host($config->dbhost);
+if ($db->connect() === false) {
+    $manager->error('Unable to connect to the MySQL server at "'.$config->dbhost.'" as root.');
+}
+
+// Only set the password if the user does not exist.
+$password = null;
+if (!$db->user_exists($config->dbuser)) {
+    $password = $config->dbpass;
+}
+if ($db->create_db_and_grant_privileges($config->dbname, $config->dbuser, $password) === false) {
+    $manager->error('Failed creating database and granting privileges.');
+}
+
+if (!$db->update_user_permissions($config)) {
+    $manager->error('Failed updating user permissions');
+}
+
+$manager->success();
+
+$installer = new moodle_19_installer($config);
+$installer->add_host_entry();
+$user = $apache->get_user();
+
+$matches = array();
+$version = 19;
+if (preg_match('/TOTARA_(\d+)_STABLE/', $config->rlscripts_git_branch, $matches)) {
+    $version = $matches[1];
+}
+
+$options = "-u {$clientadminuser->username} -f '{$front->fullname}' '{$config->dirroot}'";
+if ($version == 19) {
+    $installer->execute();
+
+    $options = "-e {$clientadminuser->email} $options";
+    $cmd = "install1";
+} else if ($version >= 20) {
+    $callback = array($manager, '_database_helper_callback');
+    $cmd = "install2";
+} else {
+    $manager->error('Unknown Totara version!');
+}
+
+$manager->message('Calling install helper script');
+$_SHELL->stdin($clientadminuser->password);
+$manager->call_helper($cmd, $options, 'Failed to install database.', $callback);
+
+$exitmessage  = "\n".CLI::green('Done!')."\n\n";
+$exitmessage .= '    Client Username: '.$clientadminuser->username."\n";
+$exitmessage .= '    Client Password: '.$clientadminuser->password."\n\n";
+
+if ($manager->load_config($config->dirroot, true) === false) {
+    // If this fails, sleep for 2 seconds and try again.
+    sleep(2);
+    $manager->load_config($config->dirroot, true);
+}
+
+$manager->status('Creating Remote-Learner Admin user');
+$cmd      = "rladmin_reset";
+$options  = "'{$config->dirroot}'";
+$manager->call_helper($cmd, $options);
+
+if (!$issimplecfg) {
+    $manager->status('Creating SFTP account');
+    if (create_sftp_account($config->dirroot, $clientadminuser->username, $clientadminuser->password)) {
+        $manager->success();
+    } else {
+        $manager->failure();
+    }
+}
+
+$manager->load_config($config->dirroot);
+$manager->status('Fixing file permissions');
+$manager->fix_permissions();
+
+$manager->message('Finishing up.');
+$manager->unblock();
+$installer->clean_host_entries();
+unset($installer);
+$manager->success();
+
+$manager->status('Sending data to Dashboard');
+passthru($_RLSCRIPTS->root.'/totara/tag "'.$config->dirroot.'"');
+$manager->history('install', 'Totara site successfully installed');
+
+// Remove cache file at end of script assuming no error was encountered.
+if ($cachesetting->remove() === false) {
+    $manager->warning('Failed to remove cache file.');
+}
+
+$manager->message($exitmessage);
+$manager->write_log();
